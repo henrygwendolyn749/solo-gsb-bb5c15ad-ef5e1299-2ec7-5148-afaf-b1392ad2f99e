@@ -588,6 +588,121 @@ async def test_release_terminal_states(client):
     assert missing.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_release_expired_while_queued_on_write_lock_records_expired(
+    client, monkeypatch
+):
+    """TTL is judged at the instant the write transaction actually starts.
+
+    Regression: release_reservation sampled ``now`` before entering its write
+    transaction.  When the call queued behind another writer past the
+    reservation's expiry, it still marked the already-dead reservation
+    ``released`` (with ``released_at``) instead of ``expired``.  Repeating the
+    request must keep returning the same idempotent expired verdict.
+    """
+    ds = _new_dataset_id("queuedrelease")
+    await _register(client, ds, eps=1.0, delta=1e-6)
+    created = (await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", epsilon=0.1, ttl=600)
+    )).json()
+    created_at = datetime.fromisoformat(created["created_at"])
+    # Backdated expiry; the queued-window instant is even earlier, so a stale
+    # pre-transaction sample still sees the reservation as valid, while real
+    # time (after the lock is acquired) is well past the expiry.
+    past = created_at - timedelta(seconds=10)
+    queued = created_at - timedelta(seconds=20)
+
+    real_utcnow = ledger.utcnow
+    async with _external_write_tx(ds, "rv", past) as holding:
+        # A pre-transaction sample (the buggy order) sees the reservation as
+        # still within its TTL; once our transaction starts real time is well
+        # past the backdated expiry.
+        def _clock():
+            if holding.is_set():
+                return queued
+            return real_utcnow()
+
+        monkeypatch.setattr(ledger, "utcnow", _clock)
+        parked = asyncio.create_task(client.post(
+            f"/datasets/{ds}/reservations/rv/release"
+        ))
+        # Let the parked release enter the write lock and block on SQLite.
+        await asyncio.sleep(0.1)
+    response = await parked
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "expired"
+    assert body["expired_at"] is not None
+    assert body["released_at"] is None
+
+    # A repeated request replays the same terminal state idempotently; it
+    # never re-stamps the reservation as released.
+    again = await client.post(f"/datasets/{ds}/reservations/rv/release")
+    assert again.status_code == 200
+    replay = again.json()
+    assert replay["idempotent_replay"] is True
+    assert replay["status"] == "expired"
+    assert replay["expired_at"] == body["expired_at"]
+    assert replay["released_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_release_valid_while_queued_on_write_lock_stamps_post_queue_instant(
+    client, monkeypatch
+):
+    """A reservation still valid once the lock is acquired releases normally.
+
+    The stale pre-queue instant is never used: ``released_at`` is stamped at
+    the post-queue instant, and the reservation is recorded as ``released``
+    rather than ``expired``.
+    """
+    ds = _new_dataset_id("queuedreleaseok")
+    await _register(client, ds, eps=1.0, delta=1e-6)
+    created = (await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", epsilon=0.1, ttl=600)
+    )).json()
+    created_at = datetime.fromisoformat(created["created_at"])
+    # The external transaction only backdates a *different* reservation; the
+    # target keeps a far-future expiry while still forcing the app writer to
+    # queue on the SQLite write lock.
+    await client.post(
+        f"/datasets/{ds}/reservations", json=_res("blocker", epsilon=0.1, ttl=600)
+    )
+    past = created_at - timedelta(seconds=10)
+    queued = created_at - timedelta(seconds=20)
+
+    real_utcnow = ledger.utcnow
+    async with _external_write_tx(ds, "blocker", past) as holding:
+        # While queued the clock reads an early instant; once the transaction
+        # starts it reads real time, at which the target is still valid.
+        def _clock():
+            if holding.is_set():
+                return queued
+            return real_utcnow()
+
+        monkeypatch.setattr(ledger, "utcnow", _clock)
+        parked = asyncio.create_task(client.post(
+            f"/datasets/{ds}/reservations/rv/release"
+        ))
+        # Let the parked release enter the write lock and block on SQLite.
+        await asyncio.sleep(0.1)
+    response = await parked
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "released"
+    assert body["released_at"] is not None
+    assert body["expired_at"] is None
+    # stamped at the post-queue real instant, not the stale queued instant.
+    released_at = datetime.fromisoformat(body["released_at"])
+    assert released_at > past
+    assert released_at >= created_at
+
+    budget = (await client.get(f"/datasets/{ds}/budget")).json()
+    assert budget["active_reservations"] == 0
+
+
 # ---------------------------------------------------------------- expiry --
 
 
@@ -639,6 +754,114 @@ async def test_expired_reservation_swept_on_create(client):
     statuses = {r["reservation_id"]: r["status"] for r in listing["reservations"]}
     assert statuses["old"] == "expired"
     assert statuses["new"] == "granted"
+
+
+@pytest.mark.asyncio
+async def test_create_expired_while_queued_on_write_lock_sweeps_and_grants(
+    client, monkeypatch
+):
+    """Sweep and RDP admission are judged at the post-queue instant.
+
+    Regression: create_reservation sampled ``now`` before entering its write
+    transaction.  An older reservation expiring while the creation queued was
+    still counted as occupying budget, so the new reservation was wrongly
+    rejected against capacity that was already free, and its TTL started
+    ticking before its transaction began.
+    """
+    ds = _new_dataset_id("queuesweep")
+    await _register(client, ds, eps=0.3, delta=1e-6)
+    created = (await client.post(
+        f"/datasets/{ds}/reservations",
+        json=_res("old", epsilon=0.25, ttl=600),
+    )).json()
+    created_at = datetime.fromisoformat(created["created_at"])
+    # The old reservation expires while the new creation is queued: the
+    # backdated expiry lies between the stale pre-transaction sample
+    # (``queued``) and real time after the lock is acquired.
+    past = created_at - timedelta(seconds=10)
+    queued = created_at - timedelta(seconds=20)
+
+    real_utcnow = ledger.utcnow
+    async with _external_write_tx(ds, "old", past) as holding:
+        # A pre-transaction sample (the buggy order) lands before the backdated
+        # expiry, so the old reservation still looks live; once our transaction
+        # starts the real time is well past it.
+        def _clock():
+            if holding.is_set():
+                return queued
+            return real_utcnow()
+
+        monkeypatch.setattr(ledger, "utcnow", _clock)
+        parked = asyncio.create_task(client.post(
+            f"/datasets/{ds}/reservations",
+            json=_res("new", epsilon=0.25, ttl=600),
+        ))
+        # Let the parked creation enter the write lock and block on SQLite.
+        await asyncio.sleep(0.1)
+    fresh = await parked
+
+    assert fresh.status_code == 201
+    body = fresh.json()
+    assert body["allowed"] is True
+    assert body["status"] == "granted"
+    # created_at / expires_at come from the post-queue instant: none of the
+    # TTL was spent queueing.
+    new_created = datetime.fromisoformat(body["created_at"])
+    new_expires = datetime.fromisoformat(body["expires_at"])
+    assert new_created > past
+    assert new_expires - new_created == timedelta(seconds=body["ttl_seconds"])
+
+    listing = (await client.get(f"/datasets/{ds}/reservations")).json()
+    statuses = {r["reservation_id"]: r["status"]
+                for r in listing["reservations"]}
+    assert statuses["old"] == "expired"
+    assert statuses["new"] == "granted"
+
+
+@pytest.mark.asyncio
+async def test_create_replay_while_queued_replays_stored_state(
+    client, monkeypatch
+):
+    """A duplicate create queued past the TTL keeps replaying the stored row.
+
+    Re-admission never runs: the idempotent replay returns the stored
+    reservation (lazily refreshed to its current state) with
+    ``idempotent_replay`` set and the original ``created_at`` untouched.
+    """
+    ds = _new_dataset_id("queuereplay")
+    await _register(client, ds, eps=1.0, delta=1e-6)
+    payload = _res("rv", epsilon=0.1, ttl=600)
+    created = (await client.post(
+        f"/datasets/{ds}/reservations", json=payload
+    )).json()
+    created_at = datetime.fromisoformat(created["created_at"])
+    past = created_at - timedelta(seconds=10)
+    queued = created_at - timedelta(seconds=20)
+
+    real_utcnow = ledger.utcnow
+    async with _external_write_tx(ds, "rv", past) as holding:
+        def _clock():
+            if holding.is_set():
+                return queued
+            return real_utcnow()
+
+        monkeypatch.setattr(ledger, "utcnow", _clock)
+        parked = asyncio.create_task(client.post(
+            f"/datasets/{ds}/reservations", json=payload
+        ))
+        await asyncio.sleep(0.1)
+    replay = await parked
+
+    assert replay.status_code == 200
+    body = replay.json()
+    assert body["idempotent_replay"] is True
+    # Judged at the post-queue instant: the stored reservation has expired,
+    # but no new admission decision or timestamps were produced.
+    assert body["status"] == "expired"
+    assert body["created_at"] == created["created_at"]
+    # The queued external transaction backdated expires_at into the past; the
+    # replay refreshes the row to expired without producing new timestamps.
+    assert body["expires_at"] == past.isoformat()
 
 
 @pytest.mark.asyncio

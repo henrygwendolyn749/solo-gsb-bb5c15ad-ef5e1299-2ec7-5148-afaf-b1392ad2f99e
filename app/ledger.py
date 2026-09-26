@@ -765,13 +765,27 @@ async def _refresh_reservation_row(
 async def create_reservation(
     dataset_id: str, payload: ReservationCreate
 ) -> tuple[dict[str, Any], int]:
-    """Atomically reserve budget; idempotent on ``reservation_id``."""
-    now = utcnow()
-    now_iso = now.isoformat()
+    """Atomically reserve budget; idempotent on ``reservation_id``.
 
+    The single UTC validity instant is captured only *after* ``BEGIN
+    IMMEDIATE`` has been acquired, i.e. after this call has passed the
+    process write lock and the SQLite write-lock queue.  The lazy expiry
+    sweep, the RDP admission check, ``created_at`` and ``expires_at`` are
+    therefore all judged or derived at that later instant.  A reservation
+    whose TTL elapses while this creation is queued behind another writer is
+    swept expired inside the same transaction and can never make the new
+    reservation be rejected against budget that is already free; the new
+    reservation's TTL starts when the transaction begins and is never
+    consumed by queueing.
+    """
     async with _write_lock():
         async with db.connect() as conn:
             await db.begin_immediate(conn)
+            # Sweep / admit / timestamp against the instant the write
+            # transaction actually starts, never an instant sampled before
+            # lock queueing.
+            now = utcnow()
+            now_iso = now.isoformat()
             try:
                 dataset = await db.require_dataset(conn, dataset_id)
 
@@ -984,12 +998,23 @@ async def release_reservation(
     Releasing an already released / expired reservation replays the final
     state.  Confirmed reservations are consumed and cannot be released;
     rejected reservations never held any budget.
-    """
-    now_iso = utcnow().isoformat()
 
+    The single UTC validity instant is captured only *after* ``BEGIN
+    IMMEDIATE`` has been acquired, i.e. after this call has passed the
+    process write lock and the SQLite write-lock queue.  TTL is therefore
+    judged at that later instant: a reservation whose TTL elapses while this
+    release is queued behind another writer is lazily expired and recorded as
+    ``expired`` (with ``expired_at``), never as ``released``; a still-valid
+    reservation is released normally and stamped with ``released_at`` at the
+    post-queue instant.  Replays return the stored terminal state untouched.
+    """
     async with _write_lock():
         async with db.connect() as conn:
             await db.begin_immediate(conn)
+            # Judge TTL and stamp the terminal state against the instant the
+            # write transaction actually starts, never an instant sampled
+            # before lock queueing.
+            now_iso = utcnow().isoformat()
             try:
                 dataset = await db.require_dataset(conn, dataset_id)
                 row = await db.get_reservation(conn, dataset_id, reservation_id)

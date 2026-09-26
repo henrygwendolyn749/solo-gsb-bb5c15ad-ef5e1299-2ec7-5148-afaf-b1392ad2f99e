@@ -542,6 +542,11 @@ curl -X POST http://localhost:8000/datasets/sales-2026/reservations \
 
 * 预算内 → `allowed=true, status="granted"`，额度立即锁定，
   `expires_at = created_at + ttl_seconds`；
+* 过期清扫、RDP 准入判定以及 `created_at` / `expires_at` 只在请求
+  **取得写锁（`BEGIN IMMEDIATE`）之后**按同一个 UTC 时刻进行：即使创建请求
+  在写锁队列中等待期间有旧预留到期，旧占额也会先在同一事务内惰性标记为
+  `expired`、不再计入预算，新预留不会因已释放的占额被误拒；新预留的 TTL
+  从事务真正开始时起算，**不会**在排队中被耗掉；
 * 超预算 → 仍返回 `201`（正常受理留痕），但 `allowed=false,
   status="rejected"`，`expires_at=null`，**不锁定任何额度**；
 * 数据集不存在 → `404`。
@@ -593,8 +598,12 @@ curl -X POST \
 
 * 对 `granted` 预留：置为 `released` 并记录 `released_at`，锁定额度
   **立即释放**，返回 `200`；
+* 是否过期只在释放请求**取得写锁（`BEGIN IMMEDIATE`）之后**按同一个 UTC
+  时刻判定并在同一事务内惰性刷新：预留若在写锁队列中等待到超过到期点，则
+  记为 `expired`（记录 `expired_at`）而非 `released`；仍未到期者才正常释放，
+  `released_at` 取取得写锁之后的时刻；
 * 重复释放已 `released` / 已 `expired` 的预留：幂等返回最终状态
-  （`idempotent_replay=true`）；
+  （`idempotent_replay=true`），沿用首次记录的终态与时间戳；
 * `confirmed` / `rejected` 预留不可释放 → `409`；
   预留不存在 → `404`。
 
@@ -1532,6 +1541,14 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
   “先到先得、额满即拒”；
 * TTL 过期为**惰性**处理：任何读写路径进入临界区时先把到期预留标记为
   `expired` 再计算额度，因此过期预留既不会继续占额，也不会被重复确认。
+* 所有与 TTL 相关的写操作（预留的创建、确认、释放、续期、调整）都只在
+  **取得写锁（`BEGIN IMMEDIATE`）之后**读取同一个 UTC 时刻，再据此惰性清扫
+  到期预留、执行 RDP 准入并填写时间戳（创建用 `created_at` / `expires_at`、
+  释放用 `released_at`、确认用 `confirmed_at`、续期判定新旧 `expires_at`）。
+  因此写请求在进程内写锁或 SQLite 写锁队列中等待所耗的时间不会被误算进 TTL：
+  排队期间到期的旧占额不会误拒新预留，新预留的 TTL 也不会在排队中被耗掉；
+  排队期间到期的释放会记 `expired` 而非 `released`，重复请求始终幂等回放已
+  落库的终态。
 * 只读的候选组合试算（selection plan）与释放预测一样**不进入写临界区、不开启
   写事务**：仅用纯 SELECT 读取未冲正申请与未到期预留后在进程内穷举子集，
   与任何并发写互不阻塞，也绝不改变数据库状态。
